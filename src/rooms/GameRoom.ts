@@ -161,7 +161,15 @@ export class GameRoom extends Room<GameRoomState> {
 
     private broadcastState() {
         console.log("Broadcasting state, phase:", this.state.phase);
-        this.broadcast("state", this.stateToJson());
+        // Send raw JSON text to bypass Colyseus's MessagePack encoding
+        const message = JSON.stringify([10, "state", this.stateToJson()]);
+        this.clients.forEach((client) => {
+            try {
+                (client as any)._ws.send(message);
+            } catch (e) {
+                console.log("Error sending to client:", e);
+            }
+        });
     }
 
     private handleSetReady(client: Client, message: { ready: boolean }) {
