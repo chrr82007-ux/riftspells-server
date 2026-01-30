@@ -6,6 +6,7 @@ import {
     Player,
     ElementOrb,
     Zone,
+    Spell,
     ElementType,
     MatchPhase,
     SigilType,
@@ -104,13 +105,13 @@ export class GameRoom extends Room<GameRoomState> {
             phase: this.state.phase,
             player1: this.state.player1 ? this.playerToJson(this.state.player1) : null,
             player2: this.state.player2 ? this.playerToJson(this.state.player2) : null,
-            orbs: Array.from(this.state.orbs).map(o => ({
+            orbs: Array.from(this.state.orbs).filter((o): o is ElementOrb => o !== undefined).map(o => ({
                 id: o.id,
                 element: o.element,
                 x: o.x,
                 y: o.y,
             })),
-            zones: Array.from(this.state.zones).map(z => ({
+            zones: Array.from(this.state.zones).filter((z): z is Zone => z !== undefined).map(z => ({
                 id: z.id,
                 spellId: z.spellId,
                 ownerId: z.ownerId,
@@ -138,7 +139,7 @@ export class GameRoom extends Room<GameRoomState> {
             username: player.username,
             selectedSigil: player.selectedSigil,
             forgeQueue: Array.from(player.forgeQueue),
-            spellSlots: Array.from(player.spellSlots).map(s => ({
+            spellSlots: Array.from(player.spellSlots).filter((s): s is Spell => s !== undefined).map(s => ({
                 id: s.id,
                 name: s.name,
                 elements: Array.from(s.elements),
