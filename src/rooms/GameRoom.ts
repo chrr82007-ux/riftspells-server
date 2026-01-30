@@ -73,6 +73,9 @@ export class GameRoom extends Room<GameRoomState> {
         if (this.state.player1 && this.state.player2) {
             this.state.phase = "sigilSelect";
         }
+
+        // Broadcast state to all clients
+        this.broadcastState();
     }
 
     onLeave(client: Client, consented: boolean) {
@@ -90,6 +93,73 @@ export class GameRoom extends Room<GameRoomState> {
                 this.state.phase = "matchEnd";
             }
         }
+
+        this.broadcastState();
+    }
+
+    // Convert state to JSON for Flutter client
+    private stateToJson(): any {
+        return {
+            roomCode: this.state.roomCode,
+            phase: this.state.phase,
+            player1: this.state.player1 ? this.playerToJson(this.state.player1) : null,
+            player2: this.state.player2 ? this.playerToJson(this.state.player2) : null,
+            orbs: Array.from(this.state.orbs).map(o => ({
+                id: o.id,
+                element: o.element,
+                x: o.x,
+                y: o.y,
+            })),
+            zones: Array.from(this.state.zones).map(z => ({
+                id: z.id,
+                spellId: z.spellId,
+                ownerId: z.ownerId,
+                primaryElement: z.primaryElement,
+                secondaryElement: z.secondaryElement,
+                x: z.x,
+                y: z.y,
+                radius: z.radius,
+                remainingDuration: z.remainingDuration,
+                damagePerSecond: z.damagePerSecond,
+            })),
+            currentRound: this.state.currentRound,
+            roundTimer: this.state.roundTimer,
+            countdownTimer: this.state.countdownTimer,
+            arenaWidth: this.state.arenaWidth,
+            arenaHeight: this.state.arenaHeight,
+            suddenDeathShrink: this.state.suddenDeathShrink,
+            winnerId: this.state.winnerId,
+        };
+    }
+
+    private playerToJson(player: Player): any {
+        return {
+            id: player.id,
+            username: player.username,
+            selectedSigil: player.selectedSigil,
+            forgeQueue: Array.from(player.forgeQueue),
+            spellSlots: Array.from(player.spellSlots).map(s => ({
+                id: s.id,
+                name: s.name,
+                elements: Array.from(s.elements),
+                maxCharges: s.maxCharges,
+                currentCharges: s.currentCharges,
+                cooldownSeconds: s.cooldownSeconds,
+                currentCooldown: s.currentCooldown,
+                duration: s.duration,
+                radius: s.radius,
+                damagePerSecond: s.damagePerSecond,
+            })),
+            crystalHealth: player.crystalHealth,
+            dispelCooldown: player.dispelCooldown,
+            roundsWon: player.roundsWon,
+            isReady: player.isReady,
+            selectedBonus: player.selectedBonus,
+        };
+    }
+
+    private broadcastState() {
+        this.broadcast("state", this.stateToJson());
     }
 
     private handleSetReady(client: Client, message: { ready: boolean }) {
@@ -106,6 +176,8 @@ export class GameRoom extends Room<GameRoomState> {
         ) {
             this.startCountdown();
         }
+
+        this.broadcastState();
     }
 
     private handleSelectSigil(client: Client, message: { sigil: SigilType }) {
@@ -113,6 +185,7 @@ export class GameRoom extends Room<GameRoomState> {
         if (!player || this.state.phase !== "sigilSelect") return;
 
         player.selectedSigil = message.sigil;
+        this.broadcastState();
     }
 
     private handleCollectOrb(client: Client, message: { orbId: string }) {
@@ -130,6 +203,8 @@ export class GameRoom extends Room<GameRoomState> {
         if (!orb) return;
         player.forgeQueue.push(orb.element);
         this.state.orbs.splice(orbIndex, 1);
+
+        this.broadcastState();
     }
 
     private handleForgeSpell(client: Client, message: { elements: number[] }) {
@@ -169,6 +244,8 @@ export class GameRoom extends Room<GameRoomState> {
         for (const idx of sortedIndices) {
             player.forgeQueue.splice(idx, 1);
         }
+
+        this.broadcastState();
     }
 
     private handleCastSpell(client: Client, message: { spellId: string; x: number; y: number }) {
@@ -211,6 +288,8 @@ export class GameRoom extends Room<GameRoomState> {
                 this.createEchoZone(zone, player.id);
             }, 1500);
         }
+
+        this.broadcastState();
     }
 
     private handleDispelPulse(client: Client, message: { x: number; y: number }) {
@@ -242,6 +321,8 @@ export class GameRoom extends Room<GameRoomState> {
 
         // Start cooldown
         player.dispelCooldown = 12;
+
+        this.broadcastState();
     }
 
     private handleSelectBonus(client: Client, message: { bonus: BonusType }) {
@@ -257,6 +338,8 @@ export class GameRoom extends Room<GameRoomState> {
         if (this.state.player1?.selectedBonus && this.state.player2?.selectedBonus) {
             this.startNextRound();
         }
+
+        this.broadcastState();
     }
 
     private getPlayer(sessionId: string): Player | undefined {
@@ -271,6 +354,7 @@ export class GameRoom extends Room<GameRoomState> {
 
         const countdown = this.clock.setInterval(() => {
             this.state.countdownTimer--;
+            this.broadcastState();
             if (this.state.countdownTimer <= 0) {
                 countdown.clear();
                 this.startCombat();
@@ -290,6 +374,8 @@ export class GameRoom extends Room<GameRoomState> {
         this.gameLoop = this.clock.setInterval(() => {
             this.tick(1 / 20); // 20fps
         }, 50);
+
+        this.broadcastState();
     }
 
     private tick(dt: number) {
@@ -319,6 +405,11 @@ export class GameRoom extends Room<GameRoomState> {
 
         // Check win condition
         this.checkWinCondition();
+
+        // Broadcast state every 100ms (5 times per second) to avoid flooding
+        if (Math.floor(this.state.roundTimer * 5) !== Math.floor((this.state.roundTimer + dt) * 5)) {
+            this.broadcastState();
+        }
     }
 
     private updateCooldowns(dt: number) {
@@ -435,8 +526,11 @@ export class GameRoom extends Room<GameRoomState> {
                 this.state.phase = "bonusSelect";
                 if (this.state.player1) this.state.player1.selectedBonus = "";
                 if (this.state.player2) this.state.player2.selectedBonus = "";
+                this.broadcastState();
             }, 2000);
         }
+
+        this.broadcastState();
     }
 
     private startNextRound() {
@@ -520,5 +614,6 @@ export class GameRoom extends Room<GameRoomState> {
         zone.damagePerSecond = originalZone.damagePerSecond * 0.5;
 
         this.state.zones.push(zone);
+        this.broadcastState();
     }
 }
