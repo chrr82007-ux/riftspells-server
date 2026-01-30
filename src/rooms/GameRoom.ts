@@ -160,6 +160,7 @@ export class GameRoom extends Room<GameRoomState> {
     }
 
     private broadcastState() {
+        console.log("Broadcasting state, phase:", this.state.phase);
         this.broadcast("state", this.stateToJson());
     }
 
