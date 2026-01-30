@@ -1,0 +1,6 @@
+# Railway/Render deployment
+.git
+node_modules
+*.md
+.env
+.env.*
