@@ -4,626 +4,321 @@ import { ArraySchema } from "@colyseus/schema";
 import {
     GameRoomState,
     Player,
-    ElementOrb,
-    Zone,
-    Spell,
-    ElementType,
+    Card,
+    RoundResult,
     MatchPhase,
-    SigilType,
-    BonusType,
+    CardType
 } from "../schema/GameState";
-import { forgeSpell, isValidCombination } from "../game/SpellEngine";
 
-// All element types
-const ELEMENTS: ElementType[] = ["fire", "ice", "wind", "earth", "lightning", "shadow"];
-
-// Generate random room code
-function generateRoomCode(): string {
-    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let code = "";
-    for (let i = 0; i < 6; i++) {
-        code += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return code;
-}
+// Card Database (Simplified for prototype)
+const CARD_TEMPLATES = [
+    { id: 'strike', name: 'Strike', cost: 1, type: 'offense', value: 10, desc: 'Deal 10 Damage' },
+    { id: 'heavy_swing', name: 'Heavy Swing', cost: 2, type: 'offense', value: 25, desc: 'Deal 25 Damage' },
+    { id: 'block', name: 'Block', cost: 1, type: 'defense', value: 10, desc: 'Block 10 Damage' },
+    { id: 'fortify', name: 'Fortify', cost: 2, type: 'defense', value: 20, desc: 'Gain 20 Shield' },
+    { id: 'heal', name: 'Heal', cost: 2, type: 'support', value: 15, desc: 'Restore 15 HP' },
+    { id: 'execute', name: 'Execute', cost: 3, type: 'offense', value: 40, desc: 'Deal 40 Damage' },
+];
 
 export class GameRoom extends Room<GameRoomState> {
-    private gameLoop?: Delayed;
-    private orbSpawnTimer: number = 0;
-    private orbSpawnInterval: number = 3; // Seconds between orb spawns
+    private turnTimerInterval?: Delayed;
 
     onCreate(options: any) {
         this.setState(new GameRoomState());
-        this.state.roomCode = generateRoomCode();
+        this.state.roomCode = this.generateRoomCode();
         this.maxClients = 2;
 
-        console.log(`Room created: ${this.state.roomCode}`);
+        console.log(`Card Game Room created: ${this.state.roomCode}`);
 
-        // Set up message handlers
-        this.onMessage("setReady", (client, message) => this.handleSetReady(client, message));
-        this.onMessage("selectSigil", (client, message) => this.handleSelectSigil(client, message));
-        this.onMessage("collectOrb", (client, message) => this.handleCollectOrb(client, message));
-        this.onMessage("forgeSpell", (client, message) => this.handleForgeSpell(client, message));
-        this.onMessage("castSpell", (client, message) => this.handleCastSpell(client, message));
-        this.onMessage("dispelPulse", (client, message) => this.handleDispelPulse(client, message));
-        this.onMessage("selectBonus", (client, message) => this.handleSelectBonus(client, message));
+        // Message Handlers
+        this.onMessage("submitHand", (client, message) => this.handleSubmitHand(client, message));
+        this.onMessage("emote", (client, message) => this.handleEmote(client, message));
     }
 
-    onJoin(client: Client, options: { username?: string; sigil?: string } = {}) {
+    onJoin(client: Client, options: { username?: string } = {}) {
         const player = new Player();
         player.id = client.sessionId;
-        player.username = options.username || `Player${Math.floor(Math.random() * 1000)}`;
-        player.selectedSigil = (options.sigil as SigilType) || "";
-        player.crystalHealth = 100;
+        player.username = options.username || `Player ${this.clients.length}`;
+        player.hp = 100;
+        player.mana = 3;
 
-        if (!this.state.player1) {
+        // Initial Hand
+        this.drawCards(player, 5);
+
+        if (this.clients.length === 1) {
             this.state.player1 = player;
-            console.log(`Player 1 joined: ${player.username}`);
-        } else if (!this.state.player2) {
+        } else if (this.clients.length === 2) {
             this.state.player2 = player;
-            console.log(`Player 2 joined: ${player.username}`);
+            this.startGame();
         }
 
-        // Send room info to client
-        client.send("roomJoined", {
-            roomCode: this.state.roomCode,
-            playerId: client.sessionId,
-        });
-
-        // Check if ready to start
-        if (this.state.player1 && this.state.player2) {
-            this.state.phase = "sigilSelect";
-        }
-
-        // Broadcast state to all clients
+        console.log(`${player.username} joined.`);
         this.broadcastState();
     }
 
-    onLeave(client: Client, consented: boolean) {
-        if (this.state.player1?.id === client.sessionId) {
-            this.state.player1 = undefined;
-        } else if (this.state.player2?.id === client.sessionId) {
-            this.state.player2 = undefined;
-        }
+    startGame() {
+        this.state.phase = "planning";
+        this.state.currentTurn = 1;
+        this.startTurnTimer();
+    }
 
-        // End match if player leaves during game
-        if (this.state.phase !== "lobby" && this.state.phase !== "matchEnd") {
-            const remainingPlayer = this.state.player1 || this.state.player2;
-            if (remainingPlayer) {
-                this.state.winnerId = remainingPlayer.id;
-                this.state.phase = "matchEnd";
+    startTurnTimer() {
+        if (this.turnTimerInterval) this.turnTimerInterval.clear();
+        this.state.turnTimer = 30;
+
+        this.turnTimerInterval = this.clock.setInterval(() => {
+            this.state.turnTimer--;
+
+            if (this.state.turnTimer <= 0) {
+                this.resolveRound(); // Auto-resolve or force submit? For now, just resolve
+                this.turnTimerInterval?.clear();
+            }
+
+            // Optimization: Don't broadcast every single second if not needed, 
+            // but for a timer it's usually fine or done client-side predictive.
+            if (this.state.turnTimer % 5 === 0 || this.state.turnTimer < 6) {
+                this.broadcastState();
+            }
+        }, 1000);
+    }
+
+    handleSubmitHand(client: Client, message: { slots: string[] }) {
+        if (this.state.phase !== "planning") return;
+
+        const player = this.getPlayer(client.sessionId);
+        if (!player || player.confirmed) return;
+
+        // Message contains Card IDs. Validate ownership and mana cost.
+        let totalCost = 0;
+        const selectedCards = new ArraySchema<Card>();
+
+        // Logic to verify cards are in hand and calculate cost
+        // Simplified: Trust the client IDs for now but check if they exist in hand map
+        // Production: Map<CardId, Card> in hand.
+
+        // We need to move cards from hand to slots
+        const newHand = new ArraySchema<Card>();
+        const handMap = new Map<string, Card>();
+        player.hand.forEach(c => handMap.set(c.id, c));
+
+        // Reset slots
+        player.slots = new ArraySchema<Card>();
+
+        // Process slots (size 3)
+        const slotIds = message.slots || [null, null, null];
+
+        for (let i = 0; i < 3; i++) {
+            const cId = slotIds[i];
+            if (cId && handMap.has(cId)) {
+                const card = handMap.get(cId)!;
+                totalCost += card.cost;
+                player.slots.push(card);
+                handMap.delete(cId); // Remove from available hand
+            } else {
+                player.slots.push(null); // Empty slot
             }
         }
 
+        if (totalCost > player.mana) {
+            // Reject submission usually, or fail silently
+            return;
+        }
+
+        // Update Hand
+        player.hand = new ArraySchema<Card>();
+        handMap.forEach(c => player.hand.push(c));
+
+        player.mana -= totalCost;
+        player.confirmed = true;
+
+        // Check if both ready
+        if (this.state.player1.confirmed && this.state.player2.confirmed) {
+            this.resolveRound();
+        } else {
+            this.broadcastState();
+        }
+    }
+
+    resolveRound() {
+        if (this.turnTimerInterval) this.turnTimerInterval.clear();
+        this.state.phase = "resolving";
         this.broadcastState();
+
+        // Simulate resolution delay
+        this.clock.setTimeout(() => {
+            this.calculateOutcome();
+        }, 500);
     }
 
-    // Convert state to JSON for Flutter client
-    private stateToJson(): any {
-        return {
-            roomCode: this.state.roomCode,
-            phase: this.state.phase,
-            player1: this.state.player1 ? this.playerToJson(this.state.player1) : null,
-            player2: this.state.player2 ? this.playerToJson(this.state.player2) : null,
-            orbs: Array.from(this.state.orbs).filter((o): o is ElementOrb => o !== undefined).map(o => ({
-                id: o.id,
-                element: o.element,
-                x: o.x,
-                y: o.y,
-            })),
-            zones: Array.from(this.state.zones).filter((z): z is Zone => z !== undefined).map(z => ({
-                id: z.id,
-                spellId: z.spellId,
-                ownerId: z.ownerId,
-                primaryElement: z.primaryElement,
-                secondaryElement: z.secondaryElement,
-                x: z.x,
-                y: z.y,
-                radius: z.radius,
-                remainingDuration: z.remainingDuration,
-                damagePerSecond: z.damagePerSecond,
-            })),
-            currentRound: this.state.currentRound,
-            roundTimer: this.state.roundTimer,
-            countdownTimer: this.state.countdownTimer,
-            arenaWidth: this.state.arenaWidth,
-            arenaHeight: this.state.arenaHeight,
-            suddenDeathShrink: this.state.suddenDeathShrink,
-            winnerId: this.state.winnerId,
-        };
-    }
+    calculateOutcome() {
+        const p1 = this.state.player1;
+        const p2 = this.state.player2;
 
-    private playerToJson(player: Player): any {
-        return {
-            id: player.id,
-            username: player.username,
-            selectedSigil: player.selectedSigil,
-            forgeQueue: Array.from(player.forgeQueue),
-            spellSlots: Array.from(player.spellSlots).filter((s): s is Spell => s !== undefined).map(s => ({
-                id: s.id,
-                name: s.name,
-                elements: Array.from(s.elements),
-                maxCharges: s.maxCharges,
-                currentCharges: s.currentCharges,
-                cooldownSeconds: s.cooldownSeconds,
-                currentCooldown: s.currentCooldown,
-                duration: s.duration,
-                radius: s.radius,
-                damagePerSecond: s.damagePerSecond,
-            })),
-            crystalHealth: player.crystalHealth,
-            dispelCooldown: player.dispelCooldown,
-            roundsWon: player.roundsWon,
-            isReady: player.isReady,
-            selectedBonus: player.selectedBonus,
-        };
-    }
+        const results = new ArraySchema<RoundResult>();
+        let p1Shield = 0;
+        let p2Shield = 0; // Shield from previous turns? Or fresh? Assume fresh.
+        let p1DmgTaken = 0;
+        let p2DmgTaken = 0;
 
-    private broadcastState() {
-        console.log("Broadcasting state, phase:", this.state.phase);
-        // Send raw JSON text to bypass Colyseus's MessagePack encoding
-        const message = JSON.stringify([10, "state", this.stateToJson()]);
-        this.clients.forEach((client) => {
-            try {
-                (client as any)._ws.send(message);
-            } catch (e) {
-                console.log("Error sending to client:", e);
+        for (let i = 0; i < 3; i++) {
+            const c1 = p1.slots[i]; // May be null/undefined if Schema behavior is weird with nulls
+            const c2 = p2.slots[i];
+
+            const res = new RoundResult();
+            res.slotIndex = i;
+            if (c1) res.playerCard = c1; // Clone?
+            if (c2) res.opponentCard = c2;
+
+            // Interaction Logic (Matches Dart Logic)
+            if (!c1 && !c2) {
+                res.log = "Empty";
+            } else if (!c1) {
+                // Direct Hit P2 -> P1
+                if (c2.type === 'offense') p1DmgTaken += c2.value;
+                if (c2.type === 'defense') p2Shield += c2.value;
+                if (c2.type === 'support' && c2.templateId === 'heal') p2Shield += c2.value; // Heal as shield/restore
+            } else if (!c2) {
+                // Direct Hit P1 -> P2
+                if (c1.type === 'offense') p2DmgTaken += c1.value;
+                if (c1.type === 'defense') p1Shield += c1.value;
+                if (c1.type === 'support' && c1.templateId === 'heal') p1Shield += c1.value;
+            } else {
+                // Head to Head
+                const mult1 = this.getMultiplier(c1.type, c2.type);
+                const mult2 = this.getMultiplier(c2.type, c1.type);
+
+                // Apply Logic
+                if (c1.type === 'offense' && c2.type === 'offense') {
+                    p2DmgTaken += c1.value;
+                    p1DmgTaken += c2.value;
+                    res.interaction = 'clash';
+                } else if (c1.type === 'offense' && c2.type === 'defense') {
+                    p1DmgTaken += Math.round(c1.value * 0.5); // Reflect
+                    p2Shield += c2.value;
+                    res.interaction = 'counter';
+                } else if (c1.type === 'defense' && c2.type === 'offense') {
+                    p2DmgTaken += Math.round(c2.value * 0.5);
+                    p1Shield += c1.value;
+                    res.interaction = 'counter';
+                } else {
+                    // Generic Buffed Damage/Shield
+                    if (c1.type === 'offense') p2DmgTaken += Math.round(c1.value * mult1);
+                    if (c2.type === 'offense') p1DmgTaken += Math.round(c2.value * mult2);
+
+                    if (c1.type === 'defense') p1Shield += Math.round(c1.value * mult1);
+                    if (c2.type === 'defense') p2Shield += Math.round(c2.value * mult2);
+
+                    if (c1.type === 'support') p1Shield += c1.value; // Heal
+                    if (c2.type === 'support') p2Shield += c2.value;
+                }
             }
-        });
-    }
 
-    private handleSetReady(client: Client, message: { ready: boolean }) {
-        const player = this.getPlayer(client.sessionId);
-        if (!player) return;
-
-        player.isReady = message.ready;
-
-        // Start countdown if both ready
-        if (
-            this.state.player1?.isReady &&
-            this.state.player2?.isReady &&
-            this.state.phase === "sigilSelect"
-        ) {
-            this.startCountdown();
+            res.damageDealt = Math.max(0, p2DmgTaken - p2Shield); // Approx per slot for log
+            res.damageTaken = Math.max(0, p1DmgTaken - p1Shield);
+            results.push(res);
         }
 
+        // Final State Update
+        const finalDamageToP1 = Math.max(0, p1DmgTaken - p1Shield);
+        const finalDamageToP2 = Math.max(0, p2DmgTaken - p2Shield);
+
+        p1.hp = Math.max(0, p1.hp - finalDamageToP1);
+        p2.hp = Math.max(0, p2.hp - finalDamageToP2);
+
+        this.state.lastRoundResults = results;
+        this.state.phase = "results";
         this.broadcastState();
-    }
 
-    private handleSelectSigil(client: Client, message: { sigil: SigilType }) {
-        const player = this.getPlayer(client.sessionId);
-        if (!player || this.state.phase !== "sigilSelect") return;
-
-        player.selectedSigil = message.sigil;
-        this.broadcastState();
-    }
-
-    private handleCollectOrb(client: Client, message: { orbId: string }) {
-        const player = this.getPlayer(client.sessionId);
-        if (!player || this.state.phase !== "combat") return;
-
-        // Check forge queue capacity
-        if (player.forgeQueue.length >= 3) return;
-
-        // Find and remove orb
-        const orbIndex = this.state.orbs.findIndex((o) => o.id === message.orbId);
-        if (orbIndex === -1) return;
-
-        const orb = this.state.orbs[orbIndex];
-        if (!orb) return;
-        player.forgeQueue.push(orb.element);
-        this.state.orbs.splice(orbIndex, 1);
-
-        this.broadcastState();
-    }
-
-    private handleForgeSpell(client: Client, message: { elements: number[] }) {
-        const player = this.getPlayer(client.sessionId);
-        if (!player || this.state.phase !== "combat") return;
-
-        const indices = message.elements;
-        if (indices.length === 0 || indices.length > 2) return;
-
-        // Validate indices
-        for (const idx of indices) {
-            if (idx < 0 || idx >= player.forgeQueue.length) return;
-        }
-
-        // Get elements from queue
-        const elements = indices.map((i) => player.forgeQueue[i] as ElementType);
-
-        // Check if valid combination
-        if (!isValidCombination(elements)) return;
-
-        // Forge the spell
-        const spell = forgeSpell(elements);
-        if (!spell) return;
-
-        // Apply sigil modifiers
-        this.applySigilToSpell(player, spell);
-
-        // Check spell slot capacity
-        if (player.spellSlots.length >= 4) {
-            // Replace oldest spell
-            player.spellSlots.shift();
-        }
-        player.spellSlots.push(spell);
-
-        // Remove used elements from queue (reverse order to maintain indices)
-        const sortedIndices = [...indices].sort((a, b) => b - a);
-        for (const idx of sortedIndices) {
-            player.forgeQueue.splice(idx, 1);
-        }
-
-        this.broadcastState();
-    }
-
-    private handleCastSpell(client: Client, message: { spellId: string; x: number; y: number }) {
-        const player = this.getPlayer(client.sessionId);
-        if (!player || this.state.phase !== "combat") return;
-
-        // Find spell
-        const spellIndex = player.spellSlots.findIndex((s) => s.id === message.spellId);
-        if (spellIndex === -1) return;
-
-        const spell = player.spellSlots[spellIndex];
-        if (!spell) return;
-
-        // Check if can cast
-        if (spell.currentCharges <= 0 || spell.currentCooldown > 0) return;
-
-        // Create zone
-        const zone = new Zone();
-        zone.id = uuidv4();
-        zone.spellId = spell.id;
-        zone.ownerId = player.id;
-        const primaryEl = spell.elements[0];
-        zone.primaryElement = (primaryEl || "fire") as ElementType;
-        zone.secondaryElement = spell.elements.length > 1 ? (spell.elements[1] || "") : "";
-        zone.x = message.x;
-        zone.y = message.y;
-        zone.radius = spell.radius;
-        zone.remainingDuration = spell.duration;
-        zone.damagePerSecond = spell.damagePerSecond;
-
-        this.state.zones.push(zone);
-
-        // Consume charge and start cooldown
-        spell.currentCharges--;
-        spell.currentCooldown = spell.cooldownSeconds;
-
-        // Echo sigil effect
-        if (player.selectedSigil === "echo") {
-            this.clock.setTimeout(() => {
-                this.createEchoZone(zone, player.id);
-            }, 1500);
-        }
-
-        this.broadcastState();
-    }
-
-    private handleDispelPulse(client: Client, message: { x: number; y: number }) {
-        const player = this.getPlayer(client.sessionId);
-        if (!player || this.state.phase !== "combat") return;
-
-        // Check cooldown
-        if (player.dispelCooldown > 0) return;
-
-        const dispelRadius = 60;
-        const dispelX = message.x;
-        const dispelY = message.y;
-
-        // Remove zones within radius
-        const zonesToRemove: number[] = [];
-        for (let i = 0; i < this.state.zones.length; i++) {
-            const zone = this.state.zones[i];
-            if (!zone) continue;
-            const dist = Math.sqrt(Math.pow(zone.x - dispelX, 2) + Math.pow(zone.y - dispelY, 2));
-            if (dist < dispelRadius + zone.radius) {
-                zonesToRemove.push(i);
+        // Next Turn Delay
+        this.clock.setTimeout(() => {
+            if (p1.hp <= 0 || p2.hp <= 0) {
+                this.state.phase = "gameOver";
+                this.state.winnerId = p1.hp > 0 ? p1.id : p2.id;
+                this.broadcastState();
+            } else {
+                this.nextTurn();
             }
-        }
+        }, 4000);
+    }
 
-        // Remove in reverse order
-        for (let i = zonesToRemove.length - 1; i >= 0; i--) {
-            this.state.zones.splice(zonesToRemove[i], 1);
-        }
+    nextTurn() {
+        this.state.phase = "planning";
+        this.state.currentTurn++;
 
-        // Start cooldown
-        player.dispelCooldown = 12;
+        const p1 = this.state.player1;
+        const p2 = this.state.player2;
 
+        // Reset round state
+        p1.confirmed = false;
+        p2.confirmed = false;
+        p1.slots = new ArraySchema<Card>();
+        p2.slots = new ArraySchema<Card>();
+
+        // Regen Mana
+        p1.mana = Math.min(p1.maxMana, p1.mana + 3);
+        p2.mana = Math.min(p2.maxMana, p2.mana + 3);
+
+        // Draw Cards
+        this.drawCards(p1, 2);
+        this.drawCards(p2, 2);
+
+        this.startTurnTimer();
         this.broadcastState();
     }
 
-    private handleSelectBonus(client: Client, message: { bonus: BonusType }) {
-        const player = this.getPlayer(client.sessionId);
-        if (!player || this.state.phase !== "bonusSelect") return;
-
-        player.selectedBonus = message.bonus;
-
-        // Apply bonus
-        this.applyBonus(player, message.bonus);
-
-        // Check if both players selected
-        if (this.state.player1?.selectedBonus && this.state.player2?.selectedBonus) {
-            this.startNextRound();
+    drawCards(player: Player, count: number) {
+        for (let i = 0; i < count; i++) {
+            if (player.hand.length >= 7) break;
+            const template = CARD_TEMPLATES[Math.floor(Math.random() * CARD_TEMPLATES.length)];
+            const card = new Card();
+            card.id = uuidv4();
+            card.templateId = template.id;
+            card.name = template.name;
+            card.cost = template.cost;
+            card.type = template.type as CardType;
+            card.value = template.value;
+            card.description = template.desc;
+            player.hand.push(card);
         }
-
-        this.broadcastState();
+        player.handCount = player.hand.length;
     }
 
-    private getPlayer(sessionId: string): Player | undefined {
+    getPlayer(sessionId: string): Player | undefined {
         if (this.state.player1?.id === sessionId) return this.state.player1;
         if (this.state.player2?.id === sessionId) return this.state.player2;
         return undefined;
     }
 
-    private startCountdown() {
-        this.state.phase = "countdown";
-        this.state.countdownTimer = 3;
-
-        const countdown = this.clock.setInterval(() => {
-            this.state.countdownTimer--;
-            this.broadcastState();
-            if (this.state.countdownTimer <= 0) {
-                countdown.clear();
-                this.startCombat();
-            }
-        }, 1000);
+    getMultiplier(type1: string, type2: string): number {
+        if (type1 === 'offense' && type2 === 'support') return 1.5;
+        if (type1 === 'support' && type2 === 'defense') return 2.0;
+        return 1.0;
     }
 
-    private startCombat() {
-        this.state.phase = "combat";
-        this.state.roundTimer = 180;
-        this.orbSpawnTimer = 0;
-
-        // Spawn initial orbs
-        this.spawnOrbs(3);
-
-        // Start game loop
-        this.gameLoop = this.clock.setInterval(() => {
-            this.tick(1 / 20); // 20fps
-        }, 50);
-
-        this.broadcastState();
+    generateRoomCode(): string {
+        const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        let code = "";
+        for (let i = 0; i < 6; i++) {
+            code += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+        return code;
     }
 
-    private tick(dt: number) {
-        if (this.state.phase !== "combat") return;
-
-        // Update round timer
-        this.state.roundTimer -= dt;
-        if (this.state.roundTimer <= 0) {
-            // Sudden death - shrink arena
-            this.state.suddenDeathShrink = Math.min(1, this.state.suddenDeathShrink + dt * 0.1);
-        }
-
-        // Spawn orbs periodically
-        this.orbSpawnTimer += dt;
-        if (this.orbSpawnTimer >= this.orbSpawnInterval && this.state.orbs.length < 5) {
-            this.spawnOrbs(1);
-            this.orbSpawnTimer = 0;
-            // Speed up spawns over time
-            this.orbSpawnInterval = Math.max(1.5, this.orbSpawnInterval - 0.1);
-        }
-
-        // Update spell cooldowns
-        this.updateCooldowns(dt);
-
-        // Update zone durations and apply damage
-        this.updateZones(dt);
-
-        // Check win condition
-        this.checkWinCondition();
-
-        // Broadcast state every 100ms (5 times per second) to avoid flooding
-        if (Math.floor(this.state.roundTimer * 5) !== Math.floor((this.state.roundTimer + dt) * 5)) {
-            this.broadcastState();
-        }
+    private handleEmote(client: Client, message: any) {
+        // ...
     }
 
-    private updateCooldowns(dt: number) {
-        for (const player of [this.state.player1, this.state.player2]) {
-            if (!player) continue;
+    private broadcastState() {
+        // Custom broadcast to ensure JSON is sent for parsing simplification in Flutter if needed, 
+        // OR standard Colyseus schema sync.
+        // Standard schema sync is better if Client supports it.
+        // Our Flutter client uses JSON parsing of a `state` message for simplicity.
 
-            // Dispel cooldown
-            if (player.dispelCooldown > 0) {
-                player.dispelCooldown = Math.max(0, player.dispelCooldown - dt);
-            }
-
-            // Spell cooldowns
-            for (const spell of player.spellSlots) {
-                if (spell.currentCooldown > 0) {
-                    spell.currentCooldown = Math.max(0, spell.currentCooldown - dt);
-                    // Restore charge when cooldown ends
-                    if (spell.currentCooldown === 0 && spell.currentCharges < spell.maxCharges) {
-                        spell.currentCharges++;
-                        spell.currentCooldown = spell.currentCharges < spell.maxCharges ? spell.cooldownSeconds : 0;
-                    }
-                }
-            }
-        }
+        const json = this.state.toJSON();
+        this.broadcast("state", { state: json });
     }
 
-    private updateZones(dt: number) {
-        const zonesToRemove: number[] = [];
-
-        for (let i = 0; i < this.state.zones.length; i++) {
-            const zone = this.state.zones[i];
-            if (!zone) continue;
-            zone.remainingDuration -= dt;
-
-            if (zone.remainingDuration <= 0) {
-                zonesToRemove.push(i);
-                continue;
-            }
-
-            // Apply damage to crystals
-            const arenaMiddle = this.state.arenaHeight / 2 + 100; // Offset for UI
-
-            // Player 1's crystal is at bottom (y > arenaMiddle)
-            // Player 2's crystal is at top (y < arenaMiddle)
-            if (this.state.player1 && zone.ownerId === this.state.player1.id && zone.y < arenaMiddle - 50) {
-                // Zone in enemy territory - damage player 2
-                if (this.state.player2) {
-                    const damage = zone.damagePerSecond * dt * 0.5; // Reduced for balance
-                    this.state.player2.crystalHealth = Math.max(0, this.state.player2.crystalHealth - damage);
-                }
-            } else if (this.state.player2 && zone.ownerId === this.state.player2.id && zone.y > arenaMiddle + 50) {
-                // Zone in enemy territory - damage player 1
-                if (this.state.player1) {
-                    const damage = zone.damagePerSecond * dt * 0.5;
-                    this.state.player1.crystalHealth = Math.max(0, this.state.player1.crystalHealth - damage);
-                }
-            }
-        }
-
-        // Remove expired zones
-        for (let i = zonesToRemove.length - 1; i >= 0; i--) {
-            this.state.zones.splice(zonesToRemove[i], 1);
-        }
-    }
-
-    private spawnOrbs(count: number) {
-        const contestedTop = 250;
-        const contestedBottom = 350;
-        const arenaLeft = 40;
-        const arenaRight = 360;
-
-        for (let i = 0; i < count; i++) {
-            const orb = new ElementOrb();
-            orb.id = uuidv4();
-            orb.element = ELEMENTS[Math.floor(Math.random() * ELEMENTS.length)];
-            orb.x = arenaLeft + Math.random() * (arenaRight - arenaLeft);
-            orb.y = contestedTop + Math.random() * (contestedBottom - contestedTop);
-            this.state.orbs.push(orb);
-        }
-    }
-
-    private checkWinCondition() {
-        // Check crystal health
-        if (this.state.player1 && this.state.player1.crystalHealth <= 0) {
-            this.endRound(this.state.player2?.id || "");
-        } else if (this.state.player2 && this.state.player2.crystalHealth <= 0) {
-            this.endRound(this.state.player1?.id || "");
-        }
-    }
-
-    private endRound(winnerId: string) {
-        this.gameLoop?.clear();
-        this.state.phase = "roundEnd";
-
-        // Award round win
-        if (this.state.player1?.id === winnerId) {
-            this.state.player1.roundsWon++;
-        } else if (this.state.player2?.id === winnerId) {
-            this.state.player2.roundsWon++;
-        }
-
-        // Check match win
-        const p1Wins = this.state.player1?.roundsWon || 0;
-        const p2Wins = this.state.player2?.roundsWon || 0;
-
-        if (p1Wins >= 3) {
-            this.state.winnerId = this.state.player1?.id || "";
-            this.state.phase = "matchEnd";
-        } else if (p2Wins >= 3) {
-            this.state.winnerId = this.state.player2?.id || "";
-            this.state.phase = "matchEnd";
-        } else {
-            // Transition to bonus select after delay
-            this.clock.setTimeout(() => {
-                this.state.phase = "bonusSelect";
-                if (this.state.player1) this.state.player1.selectedBonus = "";
-                if (this.state.player2) this.state.player2.selectedBonus = "";
-                this.broadcastState();
-            }, 2000);
-        }
-
-        this.broadcastState();
-    }
-
-    private startNextRound() {
-        this.state.currentRound++;
-
-        // Reset player states
-        if (this.state.player1) {
-            this.state.player1.crystalHealth = 100;
-            this.state.player1.forgeQueue = new ArraySchema<string>();
-            this.state.player1.dispelCooldown = 0;
-            this.state.player1.isReady = true;
-        }
-        if (this.state.player2) {
-            this.state.player2.crystalHealth = 100;
-            this.state.player2.forgeQueue = new ArraySchema<string>();
-            this.state.player2.dispelCooldown = 0;
-            this.state.player2.isReady = true;
-        }
-
-        // Clear zones and orbs
-        this.state.zones = new ArraySchema<Zone>();
-        this.state.orbs = new ArraySchema<ElementOrb>();
-        this.state.suddenDeathShrink = 0;
-        this.orbSpawnInterval = 3;
-
-        this.startCountdown();
-    }
-
-    private applySigilToSpell(player: Player, spell: any) {
-        switch (player.selectedSigil) {
-            case "stability":
-                spell.duration *= 1.3;
-                break;
-            case "greed":
-                spell.maxCharges++;
-                spell.currentCharges++;
-                spell.cooldownSeconds *= 1.25;
-                break;
-            // Other sigils apply during gameplay, not forging
-        }
-    }
-
-    private applyBonus(player: Player, bonus: BonusType) {
-        switch (bonus) {
-            case "powerSurge":
-                if (player.spellSlots.length > 0) {
-                    const randomSpell = player.spellSlots[Math.floor(Math.random() * player.spellSlots.length)];
-                    if (randomSpell) {
-                        randomSpell.maxCharges++;
-                        randomSpell.currentCharges++;
-                    }
-                }
-                break;
-            case "quickCast":
-                if (player.spellSlots.length > 0) {
-                    const randomSpell = player.spellSlots[Math.floor(Math.random() * player.spellSlots.length)];
-                    if (randomSpell) {
-                        randomSpell.cooldownSeconds *= 0.8;
-                    }
-                }
-                break;
-            case "forgeMastery":
-                // Applied during next round's forging (would need additional tracking)
-                break;
-        }
-    }
-
-    private createEchoZone(originalZone: Zone, playerId: string) {
-        if (this.state.phase !== "combat") return;
-
-        const zone = new Zone();
-        zone.id = uuidv4();
-        zone.spellId = originalZone.spellId;
-        zone.ownerId = playerId;
-        zone.primaryElement = originalZone.primaryElement;
-        zone.secondaryElement = originalZone.secondaryElement;
-        zone.x = originalZone.x + (Math.random() - 0.5) * 30;
-        zone.y = originalZone.y + (Math.random() - 0.5) * 30;
-        zone.radius = originalZone.radius * 0.7;
-        zone.remainingDuration = originalZone.remainingDuration * 0.5;
-        zone.damagePerSecond = originalZone.damagePerSecond * 0.5;
-
-        this.state.zones.push(zone);
-        this.broadcastState();
+    onLeave(client: Client) {
+        // ... Disconnection logic
     }
 }
