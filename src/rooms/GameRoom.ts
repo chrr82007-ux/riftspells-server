@@ -168,8 +168,11 @@ export class GameRoom extends Room<GameRoomState> {
         let p2DmgTaken = 0;
 
         for (let i = 0; i < 3; i++) {
-            const c1 = (p1.slots.length > i && p1.slots[i].id !== 'empty') ? p1.slots[i]! : null;
-            const c2 = (p2.slots.length > i && p2.slots[i].id !== 'empty') ? p2.slots[i]! : null;
+            const slot1 = p1.slots[i];
+            const slot2 = p2.slots[i];
+
+            const c1 = (slot1 && slot1.id !== 'empty') ? slot1 : null;
+            const c2 = (slot2 && slot2.id !== 'empty') ? slot2 : null;
 
             const res = new RoundResult();
             res.slotIndex = i;
